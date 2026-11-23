@@ -1944,6 +1944,7 @@ enum WalletService {
 struct WalletLookupView: View {
     @State private var address: String = ""
     @State private var report: WalletReport?
+    @State private var tronReport: TronReport?
     @State private var errorText: String?
     @State private var isLoading = false
     @FocusState private var focused: Bool
@@ -1959,7 +1960,7 @@ struct WalletLookupView: View {
             VStack(spacing: 20) {
                 inputCard(
                     title: "钱包地址",
-                    placeholder: "0x...",
+                    placeholder: "0x... 或 T...",
                     systemImage: "bitcoinsign.circle.fill",
                     text: $address,
                     focused: $focused,
@@ -1969,7 +1970,26 @@ struct WalletLookupView: View {
                 queryButton(title: "解析", isLoading: isLoading, action: { analyze() })
                     .disabled(!canSubmit)
 
-                if let report {
+                if let tronReport {
+                    TronSummaryCard(report: tronReport)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .bottom).combined(with: .opacity),
+                            removal: .opacity))
+
+                    ForEach(tronReport.holdings) { holding in
+                        TronTokenCard(holding: holding)
+                            .transition(.asymmetric(
+                                insertion: .move(edge: .bottom).combined(with: .opacity),
+                                removal: .opacity))
+                    }
+
+                    if tronReport.hiddenTokenCount > 0 {
+                        Text("另有 \(tronReport.hiddenTokenCount) 个代币未显示（无行情或余额过小）")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                } else if let report {
                     WalletSummaryCard(report: report)
                         .transition(.asymmetric(
                             insertion: .move(edge: .bottom).combined(with: .opacity),
@@ -2001,6 +2021,7 @@ struct WalletLookupView: View {
         .navigationTitle("加密钱包")
         .navigationBarTitleDisplayMode(.inline)
         .animation(.spring(response: 0.5, dampingFraction: 0.85), value: report?.address)
+        .animation(.spring(response: 0.5, dampingFraction: 0.85), value: tronReport?.address)
         .animation(.spring(response: 0.5, dampingFraction: 0.85), value: errorText)
         .scrollDismissesKeyboard(.interactively)
     }
@@ -2010,11 +2031,18 @@ struct WalletLookupView: View {
         isLoading = true
         errorText = nil
         report = nil
+        tronReport = nil
+
+        let input = address.trimmingCharacters(in: .whitespacesAndNewlines)
 
         Task {
             defer { isLoading = false }
             do {
-                report = try await WalletService.analyze(address)
+                if TronService.normalize(input) != nil {
+                    tronReport = try await TronService.analyze(input)
+                } else {
+                    report = try await WalletService.analyze(input)
+                }
             } catch {
                 errorText = error.localizedDescription
             }
@@ -2256,6 +2284,531 @@ private enum WalletFormat {
         formatter.currencySymbol = "$"
         formatter.maximumFractionDigits = value < 1 ? 4 : 2
         return formatter.string(from: value as NSDecimalNumber) ?? "$0"
+    }
+
+    static func date(_ value: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: value)
+    }
+}
+
+// MARK: - Tron 链支持
+
+enum TronError: LocalizedError {
+    case invalidAddress
+    case accountNotFound
+    case network(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidAddress:
+            return "地址格式不正确，请输入 T 开头的 34 位 Tron 地址。"
+        case .accountNotFound:
+            return "该地址在 Tron 链上不存在或尚未激活。"
+        case let .network(detail):
+            return "Tron 查询失败：\(detail)"
+        }
+    }
+}
+
+/// 单个 TRC20 代币持仓
+struct TronHolding: Identifiable {
+    let id: String
+    let symbol: String
+    let name: String
+    let amount: Decimal
+    /// 该代币估值的 TRX 计价（无行情时为 nil，同时用于排序）
+    let valueTRX: Decimal?
+    /// 单价（美元），无行情时为 nil
+    let unitPriceUSD: Decimal?
+    /// 估值（美元），无行情时为 nil
+    let usdValue: Decimal?
+
+    var shortContract: String { id.count > 12 ? "\(id.prefix(6))…\(id.suffix(6))" : id }
+}
+
+struct TronReport {
+    let address: String
+    let trxBalance: Decimal
+    let trxPriceUSD: Decimal?
+    let createdAt: Date?
+    let transactionCount: Int?
+    let tag: String?
+    let holdings: [TronHolding]
+    let hiddenTokenCount: Int
+
+    var hasPrice: Bool { trxPriceUSD != nil }
+
+    var totalUSD: Decimal {
+        (trxPriceUSD.map { $0 * trxBalance } ?? 0)
+            + holdings.compactMap(\.usdValue).reduce(0, +)
+    }
+
+    var totalTRX: Decimal {
+        trxBalance + holdings.compactMap(\.valueTRX).reduce(0, +)
+    }
+}
+
+private struct TronTokenEntry {
+    let contract: String
+    let symbol: String
+    let name: String
+    let amount: Decimal
+    let unitPriceTRX: Decimal?
+}
+
+private struct TronAccountSnapshot {
+    let balance: Decimal
+    let createdAt: Date?
+    let transactionCount: Int?
+    let tag: String?
+    let tokens: [TronTokenEntry]
+}
+
+/// Tron 链解析：TronScan 账户接口一次性返回 TRX 余额与全部 TRC20 行情，
+/// 再用链上 SunSwap V2 池子推算的 TRX/USD 价格换算成美元估值。
+enum TronService {
+    private static let accountURL = "https://apilist.tronscanapi.com/api/account"
+    private static let contractURL = "https://api.trongrid.io/wallet/triggerconstantcontract"
+    private static let sunswapFactory = "TKWJdrQkqHisa1X8HUdHEfREvTzw4pMAaY"
+    private static let usdtContract = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    private static let wtrxContract = "TNUC9Qb1rRpS5CbWLmNMxXBjyFoydXjWFR"
+    /// 最多展示的代币数量，避免热门地址上百个 dust 刷屏。
+    private static let maxHoldingCount = 12
+
+    private static let base58Alphabet = Array("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+    /// 校验 Tron 地址格式（T 开头、34 位、Base58 字符集）。
+    static func normalize(_ input: String) -> String? {
+        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count == 34, text.hasPrefix("T"),
+              text.allSatisfy({ base58Alphabet.contains($0) }) else { return nil }
+        return text
+    }
+
+    static func analyze(_ input: String) async throws -> TronReport {
+        guard let address = normalize(input), hexAddress(address) != nil else {
+            throw TronError.invalidAddress
+        }
+
+        async let priceTask = trxPriceUSD()
+        let snapshot = try await fetchAccount(address)
+        let trxPrice = await priceTask
+
+        var holdings: [TronHolding] = []
+        for token in snapshot.tokens {
+            let valueTRX = token.unitPriceTRX.map { $0 * token.amount }
+            holdings.append(
+                TronHolding(
+                    id: token.contract,
+                    symbol: token.symbol,
+                    name: token.name,
+                    amount: token.amount,
+                    valueTRX: valueTRX,
+                    unitPriceUSD: token.unitPriceTRX.flatMap { unit in trxPrice.map { unit * $0 } },
+                    usdValue: valueTRX.flatMap { value in trxPrice.map { value * $0 } }
+                )
+            )
+        }
+
+        // 有行情的按估值降序；一个都没有时退化为按余额数量排序。
+        let priced = holdings.filter { ($0.valueTRX ?? 0) > 0 }
+            .sorted { ($0.valueTRX ?? 0) > ($1.valueTRX ?? 0) }
+        let fallback = holdings.sorted { $0.amount > $1.amount }
+        let visible = Array((priced.isEmpty ? fallback : priced).prefix(maxHoldingCount))
+
+        return TronReport(
+            address: address,
+            trxBalance: snapshot.balance,
+            trxPriceUSD: trxPrice,
+            createdAt: snapshot.createdAt,
+            transactionCount: snapshot.transactionCount,
+            tag: snapshot.tag,
+            holdings: visible,
+            hiddenTokenCount: max(0, holdings.count - visible.count)
+        )
+    }
+
+    // MARK: 账户数据
+
+    private static func fetchAccount(_ address: String) async throws -> TronAccountSnapshot {
+        guard var components = URLComponents(string: accountURL) else {
+            throw TronError.network("接口地址无效")
+        }
+        components.queryItems = [URLQueryItem(name: "address", value: address)]
+        guard let url = components.url else { throw TronError.network("接口地址无效") }
+
+        let object = try await getJSON(url)
+        guard let balanceRaw = decimal(from: object["balance"]) else {
+            throw TronError.accountNotFound
+        }
+
+        let createdAt = (object["date_created"] as? NSNumber)
+            .flatMap { $0.doubleValue > 0 ? Date(timeIntervalSince1970: $0.doubleValue / 1000) : nil }
+        let transactionCount = (object["totalTransactionCount"] as? NSNumber).map(\.intValue)
+        let tag = (object["addressTag"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+
+        let tokens: [TronTokenEntry] = ((object["trc20token_balances"] as? [[String: Any]]) ?? [])
+            .compactMap { entry in
+                guard let contract = entry["tokenId"] as? String,
+                      let raw = decimal(from: entry["balance"]), raw > 0 else { return nil }
+
+                let decimals = (entry["tokenDecimal"] as? NSNumber)?.intValue ?? 6
+                let symbol = (entry["tokenAbbr"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                let name = (entry["tokenName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+
+                return TronTokenEntry(
+                    contract: contract,
+                    symbol: symbol ?? "未知代币",
+                    name: name ?? symbol ?? "未知代币",
+                    amount: raw / scale(decimals),
+                    unitPriceTRX: decimal(from: entry["tokenPriceInTrx"])
+                )
+            }
+
+        return TronAccountSnapshot(
+            balance: balanceRaw / scale(6),
+            createdAt: createdAt,
+            transactionCount: transactionCount,
+            tag: tag,
+            tokens: tokens
+        )
+    }
+
+    // MARK: TRX 美元价（SunSwap V2 的 WTRX/USDT 池）
+
+    private static func trxPriceUSD() async -> Decimal? {
+        guard let usdtHex = hexAddress(usdtContract),
+              let wtrxHex = hexAddress(wtrxContract),
+              let factoryHex = hexAddress(sunswapFactory) else { return nil }
+
+        let args = String(repeating: "0", count: 24) + String(wtrxHex.dropFirst(2))
+            + String(repeating: "0", count: 24) + String(usdtHex.dropFirst(2))
+
+        guard let output = await constantCall(contract: factoryHex, data: "0xe6a43905" + args),
+              output.count >= 64 else { return nil }
+
+        let pair = "41" + String(output.suffix(40))
+        guard pair != "41" + String(repeating: "0", count: 40),
+              let reserves = await reserves(pairHex: pair) else { return nil }
+
+        // Uniswap/SunSwap 交易对按地址大小排序 token0 / token1
+        let wtrxFirst = wtrxHex < usdtHex
+        let wtrxReserve = wtrxFirst ? reserves.0 : reserves.1
+        let usdtReserve = wtrxFirst ? reserves.1 : reserves.0
+        guard wtrxReserve > 0 else { return nil }
+
+        return (usdtReserve / scale(6)) / (wtrxReserve / scale(6))
+    }
+
+    private static func reserves(pairHex: String) async -> (Decimal, Decimal)? {
+        guard let output = await constantCall(contract: pairHex, data: "0x0902f1ac"),
+              output.count >= 128 else { return nil }
+
+        let start = output.startIndex
+        let first = String(output[start..<output.index(start, offsetBy: 64)])
+        let second = String(output[output.index(start, offsetBy: 64)..<output.index(start, offsetBy: 128)])
+
+        guard let r0 = WalletService.hexToDecimal(first),
+              let r1 = WalletService.hexToDecimal(second) else { return nil }
+        return (r0, r1)
+    }
+
+    // MARK: 网络与编解码
+
+    private static func constantCall(contract: String, data: String) async -> String? {
+        guard let url = URL(string: contractURL) else { return nil }
+
+        let body: [String: Any] = [
+            "owner_address": "41" + String(repeating: "00", count: 20),
+            "contract_address": contract,
+            "data": data,
+            "visible": false
+        ]
+
+        guard let object = try? await postJSON(url, body: body),
+              let results = object["constant_result"] as? [String],
+              let first = results.first, !first.isEmpty else { return nil }
+        return first
+    }
+
+    private static func getJSON(_ url: URL) async throws -> [String: Any] {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        return try await perform(request)
+    }
+
+    private static func postJSON(_ url: URL, body: [String: Any]) async throws -> [String: Any] {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 20
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return try await perform(request)
+    }
+
+    private static func perform(_ request: URLRequest) async throws -> [String: Any] {
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw TronError.network("HTTP \(http.statusCode)")
+        }
+
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw TronError.network("响应格式异常")
+        }
+        return object
+    }
+
+    /// JSON 数值统一转 Decimal，避免 Double 的二进制误差。
+    private static func decimal(from value: Any?) -> Decimal? {
+        if let text = value as? String { return Decimal(string: text) }
+        if let number = value as? NSNumber {
+            return Decimal(string: String(describing: number.doubleValue)) ?? number.decimalValue
+        }
+        return nil
+    }
+
+    private static func scale(_ decimals: Int) -> Decimal {
+        pow(Decimal(10), min(max(decimals, 0), 30))
+    }
+
+    /// Base58Check 地址转 21 字节十六进制（含 41 前缀）。
+    private static func hexAddress(_ address: String) -> String? {
+        var bytes: [UInt8] = [0]
+
+        for character in address {
+            guard let index = base58Alphabet.firstIndex(of: character) else { return nil }
+            var carry = index
+            var position = bytes.count - 1
+
+            while position >= 0 {
+                let value = Int(bytes[position]) * 58 + carry
+                bytes[position] = UInt8(value & 0xFF)
+                carry = value >> 8
+                position -= 1
+            }
+
+            while carry > 0 {
+                bytes.insert(UInt8(carry & 0xFF), at: 0)
+                carry >>= 8
+            }
+        }
+
+        let hex = bytes.map { String(format: "%02x", $0) }.joined()
+        guard hex.count >= 42 else { return nil }
+        return String(hex.prefix(42))
+    }
+}
+
+private struct TronSummaryCard: View {
+    let report: TronReport
+
+    private let tronRed = Color(red: 0.85, green: 0.22, blue: 0.22)
+    private let accentBlue = Color(red: 0.0, green: 0.42, blue: 0.86)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(
+                            LinearGradient(
+                                colors: [Color(red: 1.0, green: 0.36, blue: 0.36), tronRed],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 44, height: 44)
+
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("总资产估值")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    if report.hasPrice {
+                        Text(WalletFormat.usd(report.totalUSD))
+                            .font(.system(size: 26, weight: .bold, design: .rounded))
+                            .foregroundStyle(Color.themeInk)
+                            .contentTransition(.numericText())
+                    } else {
+                        Text("\(WalletFormat.amount(report.totalTRX)) TRX")
+                            .font(.system(size: 22, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer(minLength: 0)
+
+                Button {
+                    UIPasteboard.general.string = report.address
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.footnote)
+                        .foregroundStyle(accentBlue)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Divider()
+
+            HStack(spacing: 8) {
+                Image(systemName: "number")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Text(report.address)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            VStack(spacing: 10) {
+                infoRow("TRX 余额", "\(WalletFormat.amount(report.trxBalance)) TRX")
+
+                if let price = report.trxPriceUSD {
+                    infoRow("TRX 价格", WalletFormat.usd(price))
+                }
+                if let created = report.createdAt {
+                    infoRow("开户时间", WalletFormat.date(created))
+                }
+                if let count = report.transactionCount {
+                    infoRow("交易总数", WalletFormat.amount(Decimal(count)))
+                }
+            }
+
+            HStack(spacing: 6) {
+                statChip("TRON", systemImage: "bolt.fill")
+                statChip("\(report.holdings.count + report.hiddenTokenCount) 个代币", systemImage: "circle.fill")
+                if let tag = report.tag {
+                    statChip(tag, systemImage: "tag.fill")
+                }
+            }
+        }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
+        .shadow(color: Color.black.opacity(0.06), radius: 16, y: 8)
+    }
+
+    private func infoRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(Color.themeInk)
+        }
+    }
+
+    private func statChip(_ text: String, systemImage: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: systemImage)
+                .font(.system(size: 8))
+            Text(text)
+                .font(.caption.weight(.medium))
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(Color(.tertiarySystemFill)))
+    }
+}
+
+private struct TronTokenCard: View {
+    let holding: TronHolding
+
+    private let tronRed = Color(red: 0.85, green: 0.22, blue: 0.22)
+
+    var body: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(tronRed.opacity(0.14))
+                        .frame(width: 40, height: 40)
+
+                    Image(systemName: "hexagon.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(tronRed)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(holding.symbol)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.themeInk)
+
+                    Text(holding.shortContract)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text("\(WalletFormat.amount(holding.amount)) \(holding.symbol)")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.themeInk)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+
+                    if let usd = holding.usdValue {
+                        Text(WalletFormat.usd(usd))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if let trx = holding.valueTRX {
+                        Text("\(WalletFormat.amount(trx)) TRX")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Divider()
+
+            HStack {
+                row("单价", holding.unitPriceUSD.map(WalletFormat.usd) ?? "暂无行情")
+                Spacer(minLength: 8)
+                row("代币名称", holding.name)
+            }
+        }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
+        .shadow(color: Color.black.opacity(0.05), radius: 14, y: 7)
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(Color.themeInk)
+        }
     }
 }
 
