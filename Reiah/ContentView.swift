@@ -3068,8 +3068,17 @@ private struct TronTransactionsView: View {
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button {
-                    UIPasteboard.general.string = tx.id
+                Menu {
+                    Button {
+                        UIPasteboard.general.string = tx.isIncoming ? tx.from : tx.to
+                    } label: {
+                        Label("复制对方地址", systemImage: "person.crop.rectangle")
+                    }
+                    Button {
+                        UIPasteboard.general.string = tx.id
+                    } label: {
+                        Label("复制交易哈希", systemImage: "number.square")
+                    }
                 } label: {
                     Image(systemName: "doc.on.doc")
                         .font(.caption2)
