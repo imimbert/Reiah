@@ -1,0 +1,26 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+*.moved-aside
+*.xccheckout
+
+# Build products
+*.o
+*.d
+*.swiftmodule
+*.swiftdoc
+*.app
+*.dSYM
+*.dylib
+*.framework
+
+# OS / Editor
+.DS_Store
+*.xcbkptlist
+
+# Local data (screenshots, temp files)
+temp/
+*.log
