@@ -2364,6 +2364,8 @@ private struct TronAccountSnapshot {
     let transactionCount: Int?
     let tag: String?
     let tokens: [TronTokenEntry]
+    /// 从账户内稳定币的 tokenPriceInTrx 推导出的 TRX/USD 价（无需额外请求）
+    let derivedTrxPriceUSD: Decimal?
 }
 
 /// Tron 链解析：TronScan 账户接口一次性返回 TRX 余额与全部 TRC20 行情，
@@ -2374,6 +2376,15 @@ enum TronService {
     private static let sunswapFactory = "TKWJdrQkqHisa1X8HUdHEfREvTzw4pMAaY"
     private static let usdtContract = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
     private static let wtrxContract = "TNUC9Qb1rRpS5CbWLmNMxXBjyFoydXjWFR"
+    /// 锚定美元的稳定币合约，用于从账户响应直接推导 TRX/USD 价（无需额外请求）。
+    private static let usdStablecoins: Set<String> = [
+        "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", // USDT
+        "TEkxiTehnzSmSe2XqrBj4w32RUN966rdz8", // USDC (new)
+        "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE", // USDC (old)
+        "TPYmMKvqkvSxdSfwJJWa2rqX8vY1R8rAqG", // USDD
+        "TMwFHYXLJaRUPeW7eSAXhx1fQyK9C3PMd3", // USDJ
+        "TUpMhErZL2fhh4VQMd2SGQZ29EV8JunQ3"  // TUSD
+    ]
     /// 最多展示的代币数量，避免热门地址上百个 dust 刷屏。
     private static let maxHoldingCount = 12
 
@@ -2392,9 +2403,14 @@ enum TronService {
             throw TronError.invalidAddress
         }
 
-        async let priceTask = trxPriceUSD()
         let snapshot = try await fetchAccount(address)
-        let trxPrice = await priceTask
+        // 优先用账户内稳定币推导出的 TRX/USD 价（零额外请求），没有稳定币时才走 SunSwap 链上报价。
+        let trxPrice: Decimal?
+        if let derived = snapshot.derivedTrxPriceUSD {
+            trxPrice = derived
+        } else {
+            trxPrice = await trxPriceUSD()
+        }
 
         var holdings: [TronHolding] = []
         for token in snapshot.tokens {
@@ -2467,18 +2483,38 @@ enum TronService {
                 )
             }
 
+        // 从账户内稳定币的 tokenPriceInTrx 推导 TRX/USD：
+        // 稳定币 ≈ $1，故 TRX/USD = 1 / tokenPriceInTrx。多个稳定币取平均更稳健。
+        let stablecoinPrices = tokens.compactMap { token -> Decimal? in
+            guard usdStablecoins.contains(token.contract),
+                  let priceTRX = token.unitPriceTRX, priceTRX > 0 else { return nil }
+            return 1 / priceTRX
+        }
+        let derivedTrxPriceUSD: Decimal? = stablecoinPrices.isEmpty ? nil :
+            stablecoinPrices.reduce(0, +) / Decimal(stablecoinPrices.count)
+
         return TronAccountSnapshot(
             balance: balanceRaw / scale(6),
             createdAt: createdAt,
             transactionCount: transactionCount,
             tag: tag,
-            tokens: tokens
+            tokens: tokens,
+            derivedTrxPriceUSD: derivedTrxPriceUSD
         )
     }
 
     // MARK: TRX 美元价（SunSwap V2 的 WTRX/USDT 池）
 
     private static func trxPriceUSD() async -> Decimal? {
+        // TronGrid 限 3 rps，偶发 429；最多重试 2 次，每次间隔 1 秒。
+        for attempt in 0..<3 {
+            if let price = await sunswapTrxPrice() { return price }
+            if attempt < 2 { try? await Task.sleep(for: .seconds(1)) }
+        }
+        return nil
+    }
+
+    private static func sunswapTrxPrice() async -> Decimal? {
         guard let usdtHex = hexAddress(usdtContract),
               let wtrxHex = hexAddress(wtrxContract),
               let factoryHex = hexAddress(sunswapFactory) else { return nil }
