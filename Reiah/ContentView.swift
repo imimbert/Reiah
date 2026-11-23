@@ -143,6 +143,17 @@ struct ContentView: View {
                     ArchiveLookupView()
                 }
                 .reveal(appeared, delay: 0.23)
+
+                card(
+                    title: "加密钱包",
+                    subtitle: "解析链上地址的多链资产",
+                    systemImage: "wallet.bifold.fill",
+                    accent: Color(red: 0.42, green: 0.32, blue: 0.85),
+                    id: "wallet"
+                ) {
+                    WalletLookupView()
+                }
+                .reveal(appeared, delay: 0.31)
             }
         }
     }
@@ -185,7 +196,7 @@ struct ContentView: View {
         }
         .buttonStyle(PressableCardStyle())
         .matchedTransitionSource(id: "about", in: zoom)
-        .reveal(appeared, delay: 0.31)
+        .reveal(appeared, delay: 0.39)
     }
 }
 
@@ -975,7 +986,8 @@ private func inputCard(
     placeholder: String,
     systemImage: String,
     text: Binding<String>,
-    focused: FocusState<Bool>.Binding
+    focused: FocusState<Bool>.Binding,
+    monospaced: Bool = false
 ) -> some View {
     VStack(alignment: .leading, spacing: 10) {
         Text(title)
@@ -989,6 +1001,7 @@ private func inputCard(
                 .frame(width: 20)
 
             TextField(placeholder, text: text)
+                .font(monospaced ? .system(.body, design: .monospaced) : .body)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .submitLabel(.go)
@@ -1647,6 +1660,602 @@ private struct ArchiveSnapshotView: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm"
         return formatter.string(from: Date())
+    }
+}
+
+// MARK: - 加密钱包解析
+
+/// 支持解析的 EVM 链。RPC 走 publicnode（国内访问较快），价格用链上 Chainlink 预言机。
+enum WalletChain: String, CaseIterable, Identifiable {
+    case ethereum, bsc, polygon, arbitrum, optimism, base
+
+    var id: String { rawValue }
+
+    var name: String {
+        switch self {
+        case .ethereum: return "以太坊"
+        case .bsc: return "BNB Chain"
+        case .polygon: return "Polygon"
+        case .arbitrum: return "Arbitrum"
+        case .optimism: return "Optimism"
+        case .base: return "Base"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .ethereum, .arbitrum, .optimism, .base: return "ETH"
+        case .bsc: return "BNB"
+        case .polygon: return "POL"
+        }
+    }
+
+    var rpcURL: URL {
+        switch self {
+        case .ethereum:
+            return URL(string: "https://ethereum-rpc.publicnode.com")!
+        case .bsc:
+            return URL(string: "https://bsc-rpc.publicnode.com")!
+        case .polygon:
+            return URL(string: "https://polygon-bor-rpc.publicnode.com")!
+        case .arbitrum:
+            return URL(string: "https://arbitrum-one-rpc.publicnode.com")!
+        case .optimism:
+            return URL(string: "https://optimism-rpc.publicnode.com")!
+        case .base:
+            return URL(string: "https://base-rpc.publicnode.com")!
+        }
+    }
+
+    /// Chainlink 原生代币 / USD 价格源（8 位小数）。
+    var priceFeed: String {
+        switch self {
+        case .ethereum: return "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"
+        case .bsc: return "0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE"
+        case .polygon: return "0xAB594600376Ec9fD91F8e885dADF0CE036862dE0"
+        case .arbitrum: return "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612"
+        case .optimism: return "0x13e3Ee699D1909E989722E753853AE30b17e08c5"
+        case .base: return "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .ethereum: return Color(red: 0.38, green: 0.49, blue: 0.92)
+        case .bsc: return Color(red: 0.95, green: 0.73, blue: 0.18)
+        case .polygon: return Color(red: 0.51, green: 0.28, blue: 0.90)
+        case .arbitrum: return Color(red: 0.16, green: 0.63, blue: 0.94)
+        case .optimism: return Color(red: 1.00, green: 0.02, blue: 0.13)
+        case .base: return Color(red: 0.00, green: 0.32, blue: 1.00)
+        }
+    }
+}
+
+/// 地址类型
+enum WalletAddressKind {
+    case eoa
+    case eip7702
+    case contract
+
+    var label: String {
+        switch self {
+        case .eoa: return "普通账户"
+        case .eip7702: return "委托账户 (EIP-7702)"
+        case .contract: return "智能合约"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .eoa: return "person.fill"
+        case .eip7702: return "arrow.triangle.branch"
+        case .contract: return "shippingbox.fill"
+        }
+    }
+}
+
+struct WalletChainAsset: Identifiable {
+    let chain: WalletChain
+    let balance: Decimal
+    let price: Decimal?
+    let txCount: Int
+    let kind: WalletAddressKind
+
+    var id: String { chain.id }
+    var usdValue: Decimal? { price.map { $0 * balance } }
+    var isEmpty: Bool { balance == 0 && txCount == 0 }
+}
+
+struct WalletReport {
+    let address: String
+    let assets: [WalletChainAsset]
+    let failedChains: [String]
+
+    var totalUSD: Decimal {
+        assets.compactMap(\.usdValue).reduce(0, +)
+    }
+
+    var hasPrice: Bool {
+        assets.contains { $0.price != nil }
+    }
+}
+
+enum WalletError: LocalizedError {
+    case invalidAddress
+    case allChainsFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidAddress:
+            return "地址格式不正确，请输入 0x 开头的 42 位 EVM 地址。"
+        case let .allChainsFailed(detail):
+            return "所有链均查询失败：\(detail)"
+        }
+    }
+}
+
+/// 链上解析服务：批量 JSON-RPC 请求。
+enum WalletService {
+    /// 校验并规范化地址格式（仅格式校验，不做 EIP-55 校验和）。
+    static func normalize(_ input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let address = trimmed.hasPrefix("0x") || trimmed.hasPrefix("0X")
+            ? String(trimmed.dropFirst(2))
+            : trimmed
+
+        guard address.count == 40,
+              address.allSatisfy({ $0.isHexDigit }) else { return nil }
+
+        return "0x" + address.lowercased()
+    }
+
+    static func analyze(_ input: String) async throws -> WalletReport {
+        guard let address = normalize(input) else { throw WalletError.invalidAddress }
+
+        var assets: [WalletChainAsset] = []
+        var failures: [String] = []
+
+        await withTaskGroup(of: Result<WalletChainAsset, Error>.self) { group in
+            for chain in WalletChain.allCases {
+                group.addTask { await fetch(chain: chain, address: address) }
+            }
+
+            for await result in group {
+                switch result {
+                case let .success(asset):
+                    assets.append(asset)
+                case let .failure(error):
+                    failures.append(error.localizedDescription)
+                }
+            }
+        }
+
+        if assets.isEmpty {
+            throw WalletError.allChainsFailed(failures.first ?? "网络错误")
+        }
+
+        // 按 USD 价值降序，无余额的排最后
+        assets.sort { lhs, rhs in
+            if lhs.isEmpty != rhs.isEmpty { return !lhs.isEmpty }
+            return (lhs.usdValue ?? 0) > (rhs.usdValue ?? 0)
+        }
+
+        return WalletReport(address: address, assets: assets, failedChains: failures)
+    }
+
+    private static func fetch(chain: WalletChain, address: String) async -> Result<WalletChainAsset, Error> {
+        let requests: [[String: Any]] = [
+            ["jsonrpc": "2.0", "id": 1, "method": "eth_getBalance", "params": [address, "latest"]],
+            ["jsonrpc": "2.0", "id": 2, "method": "eth_getTransactionCount", "params": [address, "latest"]],
+            ["jsonrpc": "2.0", "id": 3, "method": "eth_getCode", "params": [address, "latest"]],
+            ["jsonrpc": "2.0", "id": 4, "method": "eth_call",
+             "params": [["to": chain.priceFeed, "data": "0xfeaf968c"], "latest"]]
+        ]
+
+        do {
+            let responses = try await batch(chain.rpcURL, requests)
+
+            let balanceHex = responses[1] as? String ?? "0x0"
+            let txHex = responses[2] as? String ?? "0x0"
+            let codeHex = responses[3] as? String ?? "0x"
+            let priceHex = responses[4] as? String
+
+            let balance = (hexToDecimal(balanceHex) ?? 0) / pow(Decimal(10), 18)
+            let txCount = NSDecimalNumber(decimal: hexToDecimal(txHex) ?? 0).intValue
+            let price = priceHex.flatMap { chainlinkAnswer($0) }
+
+            return .success(WalletChainAsset(
+                chain: chain,
+                balance: balance,
+                price: price,
+                txCount: txCount,
+                kind: addressKind(code: codeHex)
+            ))
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    /// 单个 POST 发送多条 JSON-RPC 请求，按 id 排序返回结果。
+    private static func batch(_ url: URL, _ requests: [[String: Any]]) async throws -> [Int: Any] {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 15
+        request.httpBody = try JSONSerialization.data(withJSONObject: requests)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+
+        guard let list = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw URLError(.cannotParseResponse)
+        }
+
+        var results: [Int: Any] = [:]
+        for item in list {
+            guard let id = item["id"] as? Int else { continue }
+            if let error = item["error"] as? [String: Any] {
+                throw URLError(.badServerResponse, userInfo: [NSLocalizedDescriptionKey: error["message"] ?? "RPC error"])
+            }
+            results[id] = item["result"] as Any
+        }
+        return results
+    }
+
+    /// 从 latestRoundData() 返回里取出 answer 字段（第 2 个字），除以 1e8。
+    private static func chainlinkAnswer(_ result: String) -> Decimal? {
+        var hex = result
+        guard hex.hasPrefix("0x") else { return nil }
+        hex = String(hex.dropFirst(2))
+        guard hex.count >= 128 else { return nil }
+
+        let answerStart = hex.index(hex.startIndex, offsetBy: 64)
+        let answerEnd = hex.index(answerStart, offsetBy: 64)
+        guard let raw = hexToDecimal(String(hex[answerStart..<answerEnd])) else { return nil }
+
+        return raw / pow(Decimal(10), 8)
+    }
+
+    private static func addressKind(code: String) -> WalletAddressKind {
+        let normalized = code.lowercased()
+        if normalized == "0x" || normalized.isEmpty { return .eoa }
+        if normalized.hasPrefix("0xef0100") { return .eip7702 }
+        return .contract
+    }
+
+    /// 十六进制字符串转 Decimal（支持超长 uint256）。
+    static func hexToDecimal(_ hex: String) -> Decimal? {
+        var text = hex
+        if text.hasPrefix("0x") || text.hasPrefix("0X") { text = String(text.dropFirst(2)) }
+        guard !text.isEmpty else { return 0 }
+
+        var result = Decimal(0)
+        for character in text.lowercased() {
+            guard let digit = character.hexDigitValue else { return nil }
+            result = result * 16 + Decimal(digit)
+        }
+        return result
+    }
+}
+
+struct WalletLookupView: View {
+    @State private var address: String = ""
+    @State private var report: WalletReport?
+    @State private var errorText: String?
+    @State private var isLoading = false
+    @FocusState private var focused: Bool
+
+    private let accentBlue = Color(red: 0.0, green: 0.42, blue: 0.86)
+
+    private var canSubmit: Bool {
+        !isLoading && !address.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                inputCard(
+                    title: "钱包地址",
+                    placeholder: "0x...",
+                    systemImage: "bitcoinsign.circle.fill",
+                    text: $address,
+                    focused: $focused,
+                    monospaced: true
+                )
+
+                queryButton(title: "解析", isLoading: isLoading, action: { analyze() })
+                    .disabled(!canSubmit)
+
+                if let report {
+                    WalletSummaryCard(report: report)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .bottom).combined(with: .opacity),
+                            removal: .opacity))
+
+                    ForEach(report.assets.filter { !$0.isEmpty }) { asset in
+                        WalletAssetCard(asset: asset)
+                            .transition(.asymmetric(
+                                insertion: .move(edge: .bottom).combined(with: .opacity),
+                                removal: .opacity))
+                    }
+
+                    if !report.failedChains.isEmpty {
+                        Text("部分链查询失败：\(report.failedChains.joined(separator: "、"))")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                } else if let errorText {
+                    WalletErrorCard(message: errorText)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .bottom).combined(with: .opacity),
+                            removal: .opacity))
+                }
+            }
+            .padding(20)
+        }
+        .background(backgroundGradient.ignoresSafeArea())
+        .navigationTitle("加密钱包")
+        .navigationBarTitleDisplayMode(.inline)
+        .animation(.spring(response: 0.5, dampingFraction: 0.85), value: report?.address)
+        .animation(.spring(response: 0.5, dampingFraction: 0.85), value: errorText)
+        .scrollDismissesKeyboard(.interactively)
+    }
+
+    private func analyze() {
+        focused = false
+        isLoading = true
+        errorText = nil
+        report = nil
+
+        Task {
+            defer { isLoading = false }
+            do {
+                report = try await WalletService.analyze(address)
+            } catch {
+                errorText = error.localizedDescription
+            }
+        }
+    }
+}
+
+/// 总览卡片
+private struct WalletSummaryCard: View {
+    let report: WalletReport
+
+    private let accentBlue = Color(red: 0.0, green: 0.42, blue: 0.86)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(
+                            LinearGradient(
+                                colors: [Color(red: 0.42, green: 0.32, blue: 0.85), accentBlue],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 44, height: 44)
+
+                    Image(systemName: "wallet.bifold.fill")
+                        .font(.system(size: 19, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("总资产估值")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    if report.hasPrice {
+                        Text(WalletFormat.usd(report.totalUSD))
+                            .font(.system(size: 26, weight: .bold, design: .rounded))
+                            .foregroundStyle(Color.themeInk)
+                            .contentTransition(.numericText())
+                    } else {
+                        Text("暂无价格")
+                            .font(.system(size: 22, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer(minLength: 0)
+
+                Button {
+                    UIPasteboard.general.string = report.address
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.footnote)
+                        .foregroundStyle(accentBlue)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Divider()
+
+            HStack(spacing: 8) {
+                Image(systemName: "number")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Text(report.address)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            HStack(spacing: 6) {
+                statChip("\(report.assets.count) 条链", systemImage: "link")
+                statChip("\(report.assets.filter { !$0.isEmpty }.count) 有资产", systemImage: "circle.fill")
+            }
+        }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
+        .shadow(color: Color.black.opacity(0.06), radius: 16, y: 8)
+    }
+
+    private func statChip(_ text: String, systemImage: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: systemImage)
+                .font(.system(size: 8))
+            Text(text)
+                .font(.caption.weight(.medium))
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(Color(.tertiarySystemFill)))
+    }
+}
+
+/// 单条链资产卡片
+private struct WalletAssetCard: View {
+    let asset: WalletChainAsset
+
+    var body: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(asset.chain.color.opacity(0.16))
+                        .frame(width: 40, height: 40)
+
+                    Image(systemName: "hexagon.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(asset.chain.color)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(asset.chain.name)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.themeInk)
+
+                    HStack(spacing: 5) {
+                        Image(systemName: asset.kind.symbol)
+                            .font(.system(size: 9))
+                        Text(asset.kind.label)
+                            .font(.caption2)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text("\(WalletFormat.amount(asset.balance)) \(asset.chain.symbol)")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.themeInk)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+
+                    if let usd = asset.usdValue {
+                        Text(WalletFormat.usd(usd))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Divider()
+
+            HStack {
+                row("交易数（nonce）", "\(asset.txCount)")
+                Spacer()
+                if let price = asset.price {
+                    row("\(asset.chain.symbol) 价格", WalletFormat.usd(price))
+                }
+            }
+        }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
+        .shadow(color: Color.black.opacity(0.05), radius: 14, y: 7)
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(Color.themeInk)
+        }
+    }
+}
+
+private struct WalletErrorCard: View {
+    let message: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 18))
+                .foregroundStyle(Color(red: 0.85, green: 0.45, blue: 0.1))
+                .symbolEffect(.bounce)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("解析失败")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Color.themeInk)
+
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
+        .shadow(color: Color.black.opacity(0.05), radius: 14, y: 7)
+    }
+}
+
+private enum WalletFormat {
+    static func amount(_ value: Decimal) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 6
+        return formatter.string(from: value as NSDecimalNumber) ?? "0"
+    }
+
+    static func usd(_ value: Decimal) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = "USD"
+        formatter.currencySymbol = "$"
+        formatter.maximumFractionDigits = value < 1 ? 4 : 2
+        return formatter.string(from: value as NSDecimalNumber) ?? "$0"
     }
 }
 
