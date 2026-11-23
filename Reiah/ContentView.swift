@@ -1947,6 +1947,7 @@ struct WalletLookupView: View {
     @State private var tronReport: TronReport?
     @State private var errorText: String?
     @State private var isLoading = false
+    @State private var tronTxAddress: String?
     @FocusState private var focused: Bool
 
     private let accentBlue = Color(red: 0.0, green: 0.42, blue: 0.86)
@@ -1971,10 +1972,12 @@ struct WalletLookupView: View {
                     .disabled(!canSubmit)
 
                 if let tronReport {
-                    TronSummaryCard(report: tronReport)
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .bottom).combined(with: .opacity),
-                            removal: .opacity))
+                    TronSummaryCard(report: tronReport) {
+                        tronTxAddress = tronReport.address
+                    }
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                        removal: .opacity))
 
                     ForEach(tronReport.holdings) { holding in
                         TronTokenCard(holding: holding)
@@ -2024,6 +2027,9 @@ struct WalletLookupView: View {
         .animation(.spring(response: 0.5, dampingFraction: 0.85), value: tronReport?.address)
         .animation(.spring(response: 0.5, dampingFraction: 0.85), value: errorText)
         .scrollDismissesKeyboard(.interactively)
+        .navigationDestination(item: $tronTxAddress) { addr in
+            TronTransactionsView(address: addr)
+        }
     }
 
     private func analyze() {
@@ -2328,6 +2334,22 @@ struct TronHolding: Identifiable {
     var shortContract: String { id.count > 12 ? "\(id.prefix(6))…\(id.suffix(6))" : id }
 }
 
+/// 单笔交易记录（TRX 转账或 TRC20 转账）
+struct TronTransaction: Identifiable {
+    let id: String          // 交易哈希
+    let timestamp: Date
+    let from: String
+    let to: String
+    let amount: Decimal
+    let symbol: String      // TRX 或代币简称
+    let isIncoming: Bool
+    let success: Bool
+
+    var shortFrom: String { from.count > 12 ? "\(from.prefix(6))…\(from.suffix(6))" : from }
+    var shortTo: String { to.count > 12 ? "\(to.prefix(6))…\(to.suffix(6))" : to }
+    var shortHash: String { id.count > 12 ? "\(id.prefix(8))…\(id.suffix(6))" : id }
+}
+
 struct TronReport {
     let address: String
     let trxBalance: Decimal
@@ -2444,6 +2466,82 @@ enum TronService {
             holdings: visible,
             hiddenTokenCount: max(0, holdings.count - visible.count)
         )
+    }
+
+    // MARK: 交易记录
+
+    /// 拉取最近的交易记录：TRX 原生转账 + TRC20 代币转账，按时间倒序合并。
+    static func fetchTransactions(address: String, limit: Int = 30) async throws -> [TronTransaction] {
+        async let trxTask = fetchTRXTransactions(address: address, limit: limit)
+        async let trc20Task = fetchTRC20Transfers(address: address, limit: limit)
+        let (trxTxs, trc20Txs) = try await (trxTask, trc20Task)
+
+        var merged = trxTxs + trc20Txs
+        merged.sort { $0.timestamp > $1.timestamp }
+        return Array(merged.prefix(limit))
+    }
+
+    private static func fetchTRXTransactions(address: String, limit: Int) async throws -> [TronTransaction] {
+        guard var components = URLComponents(string: "https://apilist.tronscanapi.com/api/transaction") else { return [] }
+        components.queryItems = [
+            URLQueryItem(name: "address", value: address),
+            URLQueryItem(name: "limit", value: String(limit))
+        ]
+        guard let url = components.url else { return [] }
+        let object = try await getJSON(url)
+
+        return ((object["data"] as? [[String: Any]]) ?? []).compactMap { entry in
+            // contractType 1 = TransferContract（TRX 转账）；其它类型（合约调用等）金额多为 0，跳过。
+            guard let type = entry["contractType"] as? Int, type == 1,
+                  let hash = entry["hash"] as? String,
+                  let ts = (entry["timestamp"] as? NSNumber)?.doubleValue,
+                  let from = entry["ownerAddress"] as? String,
+                  let to = entry["toAddress"] as? String,
+                  let rawAmount = decimal(from: entry["amount"]) else { return nil }
+
+            return TronTransaction(
+                id: hash,
+                timestamp: Date(timeIntervalSince1970: ts / 1000),
+                from: from,
+                to: to,
+                amount: rawAmount / scale(6),
+                symbol: "TRX",
+                isIncoming: to.caseInsensitiveCompare(address) == .orderedSame,
+                success: (entry["contractRet"] as? String) == "SUCCESS"
+            )
+        }
+    }
+
+    private static func fetchTRC20Transfers(address: String, limit: Int) async throws -> [TronTransaction] {
+        guard var components = URLComponents(string: "https://apilist.tronscanapi.com/api/token_trc20/transfers") else { return [] }
+        components.queryItems = [
+            URLQueryItem(name: "relatedAddress", value: address),
+            URLQueryItem(name: "limit", value: String(limit))
+        ]
+        guard let url = components.url else { return [] }
+        let object = try await getJSON(url)
+
+        return ((object["token_transfers"] as? [[String: Any]]) ?? []).compactMap { entry in
+            guard let hash = entry["transaction_id"] as? String,
+                  let ts = (entry["block_ts"] as? NSNumber)?.doubleValue,
+                  let from = entry["from_address"] as? String,
+                  let to = entry["to_address"] as? String,
+                  let rawAmount = decimal(from: entry["quant"]),
+                  let tokenInfo = entry["tokenInfo"] as? [String: Any],
+                  let symbol = (tokenInfo["tokenAbbr"] as? String).flatMap({ $0.isEmpty ? nil : $0 }) else { return nil }
+
+            let decimals = (tokenInfo["tokenDecimal"] as? NSNumber)?.intValue ?? 6
+            return TronTransaction(
+                id: hash,
+                timestamp: Date(timeIntervalSince1970: ts / 1000),
+                from: from,
+                to: to,
+                amount: rawAmount / scale(decimals),
+                symbol: symbol,
+                isIncoming: to.caseInsensitiveCompare(address) == .orderedSame,
+                success: true
+            )
+        }
     }
 
     // MARK: 账户数据
@@ -2640,6 +2738,7 @@ enum TronService {
 
 private struct TronSummaryCard: View {
     let report: TronReport
+    var onShowTransactions: (() -> Void)? = nil
 
     private let tronRed = Color(red: 0.85, green: 0.22, blue: 0.22)
     private let accentBlue = Color(red: 0.0, green: 0.42, blue: 0.86)
@@ -2727,6 +2826,27 @@ private struct TronSummaryCard: View {
                 if let tag = report.tag {
                     statChip(tag, systemImage: "tag.fill")
                 }
+            }
+
+            if let onShowTransactions {
+                Button(action: onShowTransactions) {
+                    HStack {
+                        Image(systemName: "list.bullet.rectangle")
+                        Text("查看交易记录")
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                    }
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(accentBlue)
+                    .padding(.vertical, 10)
+                    .padding(.horizontal, 14)
+                    .frame(maxWidth: .infinity)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(accentBlue.opacity(0.1))
+                    )
+                }
+                .buttonStyle(.plain)
             }
         }
         .padding(18)
@@ -2845,6 +2965,128 @@ private struct TronTokenCard: View {
                 .font(.caption.weight(.medium))
                 .foregroundStyle(Color.themeInk)
         }
+    }
+}
+
+// MARK: - Tron 交易记录
+
+private struct TronTransactionsView: View {
+    let address: String
+    @State private var transactions: [TronTransaction] = []
+    @State private var isLoading = true
+    @State private var errorText: String?
+
+    private let tronRed = Color(red: 0.85, green: 0.22, blue: 0.22)
+    private let accentBlue = Color(red: 0.0, green: 0.42, blue: 0.86)
+
+    var body: some View {
+        Group {
+            if isLoading {
+                ProgressView("加载交易记录…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let errorText {
+                ContentUnavailableView("加载失败", systemImage: "wifi.exclamationmark", description: Text(errorText))
+            } else if transactions.isEmpty {
+                ContentUnavailableView("暂无交易记录", systemImage: "tray", description: Text("该地址还没有转账记录"))
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        ForEach(transactions) { tx in
+                            transactionRow(tx)
+                        }
+                    }
+                    .padding(20)
+                }
+            }
+        }
+        .navigationTitle("交易记录")
+        .navigationBarTitleDisplayMode(.inline)
+        .background(Color.themeBgBottom.ignoresSafeArea())
+        .task {
+            await load()
+        }
+    }
+
+    private func load() async {
+        isLoading = true
+        errorText = nil
+        do {
+            transactions = try await TronService.fetchTransactions(address: address)
+        } catch {
+            errorText = error.localizedDescription
+        }
+        isLoading = false
+    }
+
+    private func transactionRow(_ tx: TronTransaction) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill((tx.isIncoming ? Color.green : tronRed).opacity(0.14))
+                        .frame(width: 40, height: 40)
+                    Image(systemName: tx.isIncoming ? "arrow.down.left" : "arrow.up.right")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(tx.isIncoming ? Color.green : tronRed)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(tx.isIncoming ? "收到" : "转出")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Color.themeInk)
+                        Text(tx.symbol)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        if !tx.success {
+                            Text("失败")
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.red)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Capsule().fill(Color.red.opacity(0.12)))
+                        }
+                    }
+                    Text("\(tx.timestamp, style: .date) \(tx.timestamp, style: .time)")
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+                Spacer(minLength: 8)
+
+                Text("\(tx.isIncoming ? "+" : "−")\(WalletFormat.amount(tx.amount)) \(tx.symbol)")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(tx.isIncoming ? Color.green : Color.themeInk)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+
+            HStack(spacing: 6) {
+                Text(tx.isIncoming ? "来自" : "发往")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(tx.isIncoming ? tx.shortFrom : tx.shortTo)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    UIPasteboard.general.string = tx.id
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.caption2)
+                        .foregroundStyle(accentBlue)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
     }
 }
 
