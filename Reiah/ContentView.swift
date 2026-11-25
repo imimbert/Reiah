@@ -167,6 +167,17 @@ struct ContentView: View {
                 .reveal(appeared, delay: 0.30)
 
                 card(
+                    title: "消费明细",
+                    subtitle: "按月查看每笔消费记录",
+                    systemImage: "list.bullet.rectangle",
+                    accent: Color(red: 0.80, green: 0.35, blue: 0.55),
+                    id: "consumeDetail"
+                ) {
+                    ConsumeDetailLookupView()
+                }
+                .reveal(appeared, delay: 0.33)
+
+                card(
                     title: "加密钱包",
                     subtitle: "解析链上地址的多链资产",
                     systemImage: "wallet.bifold.fill",
@@ -1343,6 +1354,418 @@ private struct ConsumeResult {
     let statusCode: Int?
     let body: String
     let months: [ConsumeMonth]?
+    let tokenExpired: Bool
+
+    var isSuccess: Bool {
+        guard let statusCode else { return false }
+        return (200..<300).contains(statusCode)
+    }
+}
+
+// MARK: - 消费明细
+
+/// 按月查看每笔消费记录：学号 + 月份 → 登录 → consumeRecordPage。
+/// 不做 Face ID 验证。
+struct ConsumeDetailLookupView: View {
+    @State private var studentId: String = ""
+    @State private var selectedMonth = Date()
+    @State private var isLoading = false
+    @State private var records: [ConsumeRecord] = []
+    @State private var errorText: String?
+    @FocusState private var focused: Bool
+
+    private let accentPink = Color(red: 0.80, green: 0.35, blue: 0.55)
+
+    private var canSubmit: Bool {
+        !isLoading && !studentId.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                inputCard(
+                    title: "学号",
+                    placeholder: "请输入 H 开头的学号",
+                    systemImage: "number",
+                    text: $studentId,
+                    focused: $focused,
+                    monospaced: true
+                )
+
+                monthPicker
+
+                queryButton(title: "查询明细", isLoading: isLoading, action: { fetch() })
+                    .disabled(!canSubmit)
+
+                if !records.isEmpty {
+                    summaryCard
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .bottom).combined(with: .opacity),
+                            removal: .opacity))
+
+                    LazyVStack(spacing: 14) {
+                        ForEach(groupedByDay, id: \.day) { group in
+                            daySection(group)
+                        }
+                    }
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                        removal: .opacity))
+                } else if let errorText {
+                    ResultCard(resultText: errorText, httpStatus: nil)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .bottom).combined(with: .opacity),
+                            removal: .opacity))
+                }
+            }
+            .padding(20)
+        }
+        .background(backgroundGradient.ignoresSafeArea())
+        .navigationTitle("消费明细")
+        .navigationBarTitleDisplayMode(.inline)
+        .animation(.spring(response: 0.5, dampingFraction: 0.85), value: records)
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: isLoading)
+        .scrollDismissesKeyboard(.interactively)
+    }
+
+    private var monthPicker: some View {
+        HStack {
+            Image(systemName: "calendar")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(accentPink)
+                .frame(width: 20)
+            DatePicker(
+                "选择月份",
+                selection: $selectedMonth,
+                displayedComponents: .date
+            )
+            .datePickerStyle(.compact)
+            .labelsHidden()
+            .environment(\.locale, Locale(identifier: "zh_CN"))
+            Spacer()
+            Text(monthLabel)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(Color.themeInk)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(.tertiarySystemFill))
+        )
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
+        .shadow(color: Color.black.opacity(0.06), radius: 16, y: 8)
+    }
+
+    private var monthLabel: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyy年M月"
+        return formatter.string(from: selectedMonth)
+    }
+
+    /// 按消费日期分组（同一天的记录放一起）
+    private var groupedByDay: [(day: String, records: [ConsumeRecord], total: Decimal)] {
+        let calendar = Calendar.current
+        let groups = Dictionary(grouping: records) { record -> String in
+            if let date = record.date {
+                let comps = calendar.dateComponents([.year, .month, .day], from: date)
+                return String(format: "%04d-%02d-%02d", comps.year ?? 0, comps.month ?? 0, comps.day ?? 0)
+            }
+            return "未知日期"
+        }
+        return groups
+            .map { (day: $0.key, records: $0.value.sorted { $0.timeString > $1.timeString },
+                     total: $0.value.reduce(0) { $0 + $1.amount }) }
+            .sorted { $0.day > $1.day }
+    }
+
+    private var summaryCard: some View {
+        let total = records.reduce(0) { $0 + $1.amount }
+        let typeTotals = Dictionary(grouping: records) { $0.type }
+            .mapValues { $0.reduce(0) { $0 + $1.amount } }
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(monthLabel) 消费汇总")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text("¥ \(WalletFormat.amount(total))")
+                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.themeInk)
+                }
+                Spacer()
+                Text("\(records.count) 笔")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(Capsule().fill(Color(.tertiarySystemFill)))
+            }
+
+            Divider()
+
+            HStack(spacing: 10) {
+                ForEach(ConsumeType.allCases, id: \.self) { type in
+                    if let amount = typeTotals[type.rawValue] {
+                        typeStat(type: type, amount: amount)
+                    }
+                }
+            }
+        }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
+        .shadow(color: Color.black.opacity(0.06), radius: 16, y: 8)
+    }
+
+    private func typeStat(type: ConsumeType, amount: Decimal) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: type.icon)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(type.color)
+            Text(type.label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("¥ \(WalletFormat.amount(amount))")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.themeInk)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(type.color.opacity(0.08))
+        )
+    }
+
+    private func daySection(_ group: (day: String, records: [ConsumeRecord], total: Decimal)) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(group.day)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Color.themeInk)
+                Spacer()
+                Text("¥ \(WalletFormat.amount(group.total))")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(accentPink)
+            }
+
+            VStack(spacing: 0) {
+                ForEach(Array(group.records.enumerated()), id: \.element.id) { index, record in
+                    recordRow(record)
+                    if index < group.records.count - 1 {
+                        Divider().padding(.leading, 52)
+                    }
+                }
+            }
+            .padding(14)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(.regularMaterial)
+            )
+        }
+    }
+
+    private func recordRow(_ record: ConsumeRecord) -> some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(record.consumeType.color.opacity(0.14))
+                    .frame(width: 36, height: 36)
+                Image(systemName: record.consumeType.icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(record.consumeType.color)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(record.place)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(Color.themeInk)
+                    .lineLimit(1)
+                Text(record.timeString)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 8)
+
+            Text("−¥ \(WalletFormat.amount(record.amount))")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Color.themeInk)
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func fetch() {
+        focused = false
+        Task { await performRequest() }
+    }
+
+    private func performRequest() async {
+        isLoading = true
+        records = []
+        errorText = nil
+        defer { isLoading = false }
+
+        let account = studentId.trimmingCharacters(in: .whitespaces)
+        guard !account.isEmpty else { return }
+
+        let calendar = Calendar.current
+        let comps = calendar.dateComponents([.year, .month], from: selectedMonth)
+        guard let year = comps.year, let month = comps.month else { return }
+
+        let startDate = String(format: "%04d-%02d-01", year, month)
+        let range = calendar.range(of: .day, in: .month, for: selectedMonth)
+        let lastDay = range?.count ?? 28
+        let endDate = String(format: "%04d-%02d-%02d", year, month, lastDay)
+
+        do {
+            var session = try await AuthService.login(for: account)
+            var result = try await requestDetail(cardCode: account, startDate: startDate, endDate: endDate, token: session.token)
+
+            if result.tokenExpired {
+                session = try await AuthService.login(for: account, forceRefresh: true)
+                result = try await requestDetail(cardCode: account, startDate: startDate, endDate: endDate, token: session.token)
+            }
+
+            guard result.isSuccess, let list = result.records else {
+                throw ArchiveRequestError.response(statusCode: result.statusCode, body: result.body)
+            }
+
+            guard !list.isEmpty else {
+                errorText = "\(monthLabel) 暂无消费记录"
+                return
+            }
+
+            records = list
+        } catch {
+            errorText = "查询失败：\((error as? ArchiveRequestError)?.errorDescription ?? error.localizedDescription)"
+        }
+    }
+
+    private func requestDetail(cardCode: String, startDate: String, endDate: String, token: String) async throws -> ConsumeDetailResult {
+        var components = URLComponents(string: "https://portal.haierschool.cn/v/payCardTrade/consumeRecordPage")!
+        components.queryItems = [
+            URLQueryItem(name: "pageNum", value: "1"),
+            URLQueryItem(name: "pageSize", value: "500"),
+            URLQueryItem(name: "cardCode", value: cardCode),
+            URLQueryItem(name: "startDate", value: startDate),
+            URLQueryItem(name: "endDate", value: endDate)
+        ]
+
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json;charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("3", forHTTPHeaderField: "sysType")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 60
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode
+            let body = String(data: data, encoding: .utf8) ?? "<无法解析响应>"
+
+            let tokenExpired = statusCode == 401 || statusCode == 403 || SessionStore.responseIndicatesExpired(data)
+
+            guard (200..<300).contains(statusCode ?? -1),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let code = object["code"] as? Int, code == 200
+            else {
+                return ConsumeDetailResult(statusCode: statusCode, body: body, records: nil, tokenExpired: tokenExpired)
+            }
+
+            // 记录在 data.rows 里
+            let dataObj = object["data"] as? [String: Any]
+            let rows = (dataObj?["rows"] as? [[String: Any]]) ?? []
+            let records = rows.compactMap(ConsumeRecord.init)
+
+            return ConsumeDetailResult(statusCode: statusCode, body: body, records: records, tokenExpired: false)
+        } catch {
+            throw ArchiveRequestError.message(error.localizedDescription)
+        }
+    }
+}
+
+private enum ConsumeType: String, CaseIterable {
+    case breakfast = "早餐"
+    case lunch = "午餐"
+    case dinner = "晚餐"
+    case store = "超市类"
+    case other = "其他"
+
+    var label: String { rawValue }
+    var icon: String {
+        switch self {
+        case .breakfast: return "cup.and.saucer.fill"
+        case .lunch: return "fork.knife"
+        case .dinner: return "moon.stars.fill"
+        case .store: return "cart.fill"
+        case .other: return "doc.text.fill"
+        }
+    }
+    var color: Color {
+        switch self {
+        case .breakfast: return Color.orange
+        case .lunch: return Color.green
+        case .dinner: return Color.purple
+        case .store: return Color.blue
+        case .other: return Color.gray
+        }
+    }
+}
+
+private struct ConsumeRecord: Identifiable, Equatable {
+    let id: Int
+    let amount: Decimal
+    let place: String
+    let type: String
+    let timeString: String
+    let date: Date?
+
+    var consumeType: ConsumeType {
+        ConsumeType(rawValue: type) ?? .other
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
+
+    init?(from row: [String: Any]) {
+        guard let id = row["id"] as? Int,
+              let amountNum = row["totalAmount"] as? NSNumber,
+              let time = row["createTime"] as? String
+        else { return nil }
+
+        self.id = id
+        self.amount = amountNum.decimalValue
+        self.place = (row["consumePlace"] as? String) ?? (row["consumeItemName"] as? String) ?? "未知"
+        self.type = (row["consumeType"] as? String) ?? "其他"
+        self.timeString = String(time.suffix(8))  // "HH:mm:ss"
+        self.date = ConsumeRecord.dateFormatter.date(from: time)
+    }
+}
+
+private struct ConsumeDetailResult {
+    let statusCode: Int?
+    let body: String
+    let records: [ConsumeRecord]?
     let tokenExpired: Bool
 
     var isSuccess: Bool {
