@@ -145,6 +145,17 @@ struct ContentView: View {
                 .reveal(appeared, delay: 0.23)
 
                 card(
+                    title: "查卡余额",
+                    subtitle: "输入学号查询一卡通余额",
+                    systemImage: "creditcard.fill",
+                    accent: Color(red: 0.20, green: 0.62, blue: 0.45),
+                    id: "card"
+                ) {
+                    CardBalanceLookupView()
+                }
+                .reveal(appeared, delay: 0.27)
+
+                card(
                     title: "加密钱包",
                     subtitle: "解析链上地址的多链资产",
                     systemImage: "wallet.bifold.fill",
@@ -759,19 +770,14 @@ struct ArchiveLookupView: View {
 
         do {
             // 1. 先取登录会话（token + userId）；本地已有则直接复用，不再发登录请求。
-            var session: LoginSession
-            if let cached = SessionStore.session(for: account) {
-                session = cached
-            } else {
-                session = try await login(for: account)
-            }
+            var session = try await AuthService.login(for: account)
 
             // 2. 用登录返回的 userId 查档。
             var archiveResult = try await requestArchive(userId: session.userId, token: session.token)
 
             // 3. 只有服务端明确拒绝当前 token 时才重新登录一次，再查一次。
             if archiveResult.tokenExpired {
-                session = try await login(for: account)
+                session = try await AuthService.login(for: account)
                 archiveResult = try await requestArchive(userId: session.userId, token: session.token)
             }
 
@@ -790,40 +796,6 @@ struct ArchiveLookupView: View {
             profile = nil
             httpStatus = (error as? ArchiveRequestError)?.statusCode
             resultText = "请求失败：\(error.localizedDescription)"
-        }
-    }
-
-    /// 调用 /login，解析出 token 与 userId，并按账号缓存到本地。
-    private func login(for account: String) async throws -> LoginSession {
-        var request = URLRequest(url: URL(string: "https://portal.haierschool.cn/v/login")!)
-        request.httpMethod = "POST"
-        request.setValue("application/json;charset=utf-8", forHTTPHeaderField: "Content-Type")
-        request.setValue("3", forHTTPHeaderField: "sysType")
-        request.setValue("false", forHTTPHeaderField: "isToken")
-        request.timeoutInterval = 60
-
-        let body: [String: String] = [
-            "username": account,
-            "password": "HS123456",
-            "sysType": "3"
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            let statusCode = (response as? HTTPURLResponse)?.statusCode
-
-            guard (200..<300).contains(statusCode ?? -1), let session = SessionStore.session(from: data) else {
-                let responseBody = String(data: data, encoding: .utf8) ?? "<无法解析响应>"
-                throw ArchiveRequestError.response(statusCode: statusCode, body: responseBody)
-            }
-
-            SessionStore.save(session: session, for: account)
-            return session
-        } catch let error as ArchiveRequestError {
-            throw error
-        } catch {
-            throw ArchiveRequestError.message(error.localizedDescription)
         }
     }
 
@@ -847,6 +819,192 @@ struct ArchiveLookupView: View {
                 body: body,
                 tokenExpired: statusCode == 401 || statusCode == 403 || SessionStore.responseIndicatesExpired(data)
             )
+        } catch {
+            throw ArchiveRequestError.message(error.localizedDescription)
+        }
+    }
+}
+
+// MARK: - 查卡余额
+
+/// 个人一卡通余额查询：输入 H 开头学号 → 登录拿 userId → 调 personCardBalance。
+/// 不做 Face ID 验证，直接查询。
+struct CardBalanceLookupView: View {
+    @State private var studentId: String = ""
+    @State private var isLoading = false
+    @State private var balance: Decimal?
+    @State private var errorText: String?
+    @State private var queriedAccount: String?
+    @FocusState private var focused: Bool
+
+    private let accentBlue = Color(red: 0.0, green: 0.42, blue: 0.86)
+
+    private var canSubmit: Bool {
+        !isLoading && !studentId.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                inputCard(
+                    title: "学号",
+                    placeholder: "请输入 H 开头的学号",
+                    systemImage: "number",
+                    text: $studentId,
+                    focused: $focused,
+                    monospaced: true
+                )
+
+                queryButton(title: "查询余额", isLoading: isLoading, action: { fetch() })
+                    .disabled(!canSubmit)
+
+                if balance != nil {
+                    balanceCard
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .bottom).combined(with: .opacity),
+                            removal: .opacity))
+                } else if let errorText {
+                    ResultCard(resultText: errorText, httpStatus: nil)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .bottom).combined(with: .opacity),
+                            removal: .opacity))
+                }
+            }
+            .padding(20)
+        }
+        .background(backgroundGradient.ignoresSafeArea())
+        .navigationTitle("查卡余额")
+        .navigationBarTitleDisplayMode(.inline)
+        .animation(.spring(response: 0.5, dampingFraction: 0.85), value: balance)
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: isLoading)
+        .scrollDismissesKeyboard(.interactively)
+    }
+
+    private var balanceCard: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                Image(systemName: "creditcard.fill")
+                    .font(.title2)
+                    .foregroundStyle(.white)
+                Spacer()
+                Text("一卡通")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+
+            Spacer(minLength: 10)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("当前余额")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.7))
+                Text("¥ \(WalletFormat.amount(balance ?? 0))")
+                    .font(.system(size: 38, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+            }
+
+            Spacer(minLength: 12)
+
+            HStack {
+                if let queriedAccount {
+                    Label(queriedAccount, systemImage: "person.crop.circle")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.75))
+                        .lineLimit(1)
+                }
+                Spacer()
+                Text(Date(), style: .time)
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+        }
+        .padding(22)
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.0, green: 0.42, blue: 0.86),
+                            Color(red: 0.18, green: 0.55, blue: 0.95)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .strokeBorder(.white.opacity(0.2), lineWidth: 1)
+        )
+        .shadow(color: accentBlue.opacity(0.35), radius: 20, y: 10)
+    }
+
+    private func fetch() {
+        focused = false
+        Task { await performRequest() }
+    }
+
+    private func performRequest() async {
+        isLoading = true
+        balance = nil
+        errorText = nil
+        defer { isLoading = false }
+
+        let account = studentId.trimmingCharacters(in: .whitespaces)
+        guard !account.isEmpty else { return }
+        queriedAccount = account
+
+        do {
+            // 1. 登录拿 userId（belongUserId）
+            let session = try await AuthService.login(for: account)
+
+            // 2. 查余额
+            let amount = try await requestBalance(userId: session.userId, token: session.token)
+            balance = amount
+        } catch {
+            errorText = "查询失败：\((error as? ArchiveRequestError)?.errorDescription ?? error.localizedDescription)"
+        }
+    }
+
+    private func requestBalance(userId: String, token: String) async throws -> Decimal {
+        var components = URLComponents(string: "https://portal.haierschool.cn/v/payCardTrade/personCardBalance")!
+        components.queryItems = [URLQueryItem(name: "belongUserId", value: userId)]
+
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json;charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("3", forHTTPHeaderField: "sysType")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 60
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode
+
+            guard (200..<300).contains(statusCode ?? -1) else {
+                let body = String(data: data, encoding: .utf8) ?? "<无法解析响应>"
+                throw ArchiveRequestError.response(statusCode: statusCode, body: body)
+            }
+
+            guard
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let code = object["code"] as? Int, code == 200
+            else {
+                let body = String(data: data, encoding: .utf8) ?? "<无法解析响应>"
+                throw ArchiveRequestError.response(statusCode: statusCode, body: body)
+            }
+
+            // balanceAmount 可能是 Double 或 String
+            if let number = object["balanceAmount"] as? NSNumber {
+                return number.decimalValue
+            }
+            if let text = object["balanceAmount"] as? String, let value = Decimal(string: text) {
+                return value
+            }
+            throw ArchiveRequestError.message("余额字段缺失或格式异常")
+        } catch let error as ArchiveRequestError {
+            throw error
         } catch {
             throw ArchiveRequestError.message(error.localizedDescription)
         }
@@ -887,6 +1045,42 @@ private enum ArchiveRequestError: LocalizedError {
 private struct LoginSession: Codable {
     let token: String
     let userId: String
+}
+
+/// 共享的登录入口：用户名即学号，默认密码 HS123456，sysType=3。
+/// 本地已缓存则直接返回，避免每次都重新登录。
+private enum AuthService {
+    static func login(for account: String) async throws -> LoginSession {
+        if let cached = SessionStore.session(for: account) {
+            return cached
+        }
+
+        var request = URLRequest(url: URL(string: "https://portal.haierschool.cn/v/login")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json;charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("3", forHTTPHeaderField: "sysType")
+        request.setValue("false", forHTTPHeaderField: "isToken")
+        request.timeoutInterval = 60
+
+        let body: [String: String] = [
+            "username": account,
+            "password": "HS123456",
+            "sysType": "3"
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let statusCode = (response as? HTTPURLResponse)?.statusCode
+
+        guard (200..<300).contains(statusCode ?? -1),
+              let session = SessionStore.session(from: data) else {
+            let responseBody = String(data: data, encoding: .utf8) ?? "<无法解析响应>"
+            throw ArchiveRequestError.response(statusCode: statusCode, body: responseBody)
+        }
+
+        SessionStore.save(session: session, for: account)
+        return session
+    }
 }
 
 /// 按账号缓存登录会话，避免每次查档都重新登录。
