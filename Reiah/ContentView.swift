@@ -156,6 +156,17 @@ struct ContentView: View {
                 .reveal(appeared, delay: 0.27)
 
                 card(
+                    title: "查消费",
+                    subtitle: "输入学号查询月度消费汇总",
+                    systemImage: "fork.knife",
+                    accent: Color(red: 0.90, green: 0.45, blue: 0.20),
+                    id: "consume"
+                ) {
+                    ConsumeLookupView()
+                }
+                .reveal(appeared, delay: 0.30)
+
+                card(
                     title: "加密钱包",
                     subtitle: "解析链上地址的多链资产",
                     systemImage: "wallet.bifold.fill",
@@ -1026,6 +1037,317 @@ private struct BalanceResult {
     var isSuccess: Bool {
         guard let statusCode else { return false }
         return (200..<300).contains(statusCode) && amount != nil
+    }
+}
+
+// MARK: - 查消费
+
+/// 月度消费汇总：输入 H 开头学号 → 登录 → 调 personalMonthConsumeList 按 card_code 过滤。
+/// 不做 Face ID 验证。
+struct ConsumeLookupView: View {
+    @State private var studentId: String = ""
+    @State private var isLoading = false
+    @State private var report: ConsumeReport?
+    @State private var errorText: String?
+    @FocusState private var focused: Bool
+
+    private let accentOrange = Color(red: 0.90, green: 0.45, blue: 0.20)
+
+    private var canSubmit: Bool {
+        !isLoading && !studentId.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                inputCard(
+                    title: "学号",
+                    placeholder: "请输入 H 开头的学号",
+                    systemImage: "number",
+                    text: $studentId,
+                    focused: $focused,
+                    monospaced: true
+                )
+
+                queryButton(title: "查询消费", isLoading: isLoading, action: { fetch() })
+                    .disabled(!canSubmit)
+
+                if let report {
+                    summaryCard(report)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .bottom).combined(with: .opacity),
+                            removal: .opacity))
+
+                    LazyVStack(spacing: 12) {
+                        ForEach(report.months) { month in
+                            monthRow(month)
+                        }
+                    }
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                        removal: .opacity))
+                } else if let errorText {
+                    ResultCard(resultText: errorText, httpStatus: nil)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .bottom).combined(with: .opacity),
+                            removal: .opacity))
+                }
+            }
+            .padding(20)
+        }
+        .background(backgroundGradient.ignoresSafeArea())
+        .navigationTitle("查消费")
+        .navigationBarTitleDisplayMode(.inline)
+        .animation(.spring(response: 0.5, dampingFraction: 0.85), value: report)
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: isLoading)
+        .scrollDismissesKeyboard(.interactively)
+    }
+
+    private func summaryCard(_ report: ConsumeReport) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(report.name)
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(Color.themeInk)
+                    Text(report.className)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "fork.knife")
+                    .font(.title2)
+                    .foregroundStyle(accentOrange)
+            }
+
+            HStack(spacing: 12) {
+                statBlock(title: "累计消费", value: "¥ \(WalletFormat.amount(report.totalAmount))")
+                statBlock(title: "月均消费", value: "¥ \(WalletFormat.amount(report.avgAmount))")
+                statBlock(title: "消费月数", value: "\(report.months.count)")
+            }
+
+            if let latest = report.months.first {
+                HStack(spacing: 12) {
+                    statBlock(title: "最新月份", value: latest.date)
+                    statBlock(title: "当月消费", value: "¥ \(WalletFormat.amount(latest.amount))")
+                    statBlock(title: "就餐率", value: latest.dayRatio)
+                }
+            }
+        }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
+        .shadow(color: Color.black.opacity(0.06), radius: 16, y: 8)
+    }
+
+    private func statBlock(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Color.themeInk)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func monthRow(_ month: ConsumeMonth) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(month.date)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Color.themeInk)
+                Spacer()
+                Text("¥ \(WalletFormat.amount(month.amount))")
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(accentOrange)
+            }
+
+            HStack(spacing: 14) {
+                Label("\(month.times) 次", systemImage: "repeat")
+                Label("\(month.consumeDays) 天", systemImage: "calendar")
+                Label("就餐 \(month.diningDays) 天", systemImage: "fork.knife")
+                Spacer()
+                Text(month.dayRatio)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            // 就餐率进度条
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color(.tertiarySystemFill))
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(month.isNormal ? Color.green : accentOrange)
+                        .frame(width: max(4, geo.size.width * month.ratioValue))
+                }
+            }
+            .frame(height: 6)
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
+    }
+
+    private func fetch() {
+        focused = false
+        Task { await performRequest() }
+    }
+
+    private func performRequest() async {
+        isLoading = true
+        report = nil
+        errorText = nil
+        defer { isLoading = false }
+
+        let account = studentId.trimmingCharacters(in: .whitespaces)
+        guard !account.isEmpty else { return }
+
+        do {
+            var session = try await AuthService.login(for: account)
+            var result = try await requestConsume(cardCode: account, token: session.token)
+
+            if result.tokenExpired {
+                session = try await AuthService.login(for: account, forceRefresh: true)
+                result = try await requestConsume(cardCode: account, token: session.token)
+            }
+
+            guard result.isSuccess, let months = result.months else {
+                throw ArchiveRequestError.response(statusCode: result.statusCode, body: result.body)
+            }
+
+            guard !months.isEmpty else {
+                errorText = "该学号暂无消费记录"
+                return
+            }
+
+            report = ConsumeReport(
+                name: months.first?.name ?? account,
+                className: months.first?.className ?? "",
+                months: months
+            )
+        } catch {
+            errorText = "查询失败：\((error as? ArchiveRequestError)?.errorDescription ?? error.localizedDescription)"
+        }
+    }
+
+    private func requestConsume(cardCode: String, token: String) async throws -> ConsumeResult {
+        var components = URLComponents(string: "https://portal.haierschool.cn/v/datawayapi/payConsume/personalMonthConsumeList")!
+        components.queryItems = [URLQueryItem(name: "card_code", value: cardCode)]
+
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json;charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("3", forHTTPHeaderField: "sysType")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 60
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode
+            let body = String(data: data, encoding: .utf8) ?? "<无法解析响应>"
+
+            let tokenExpired = statusCode == 401 || statusCode == 403 || SessionStore.responseIndicatesExpired(data)
+
+            guard (200..<300).contains(statusCode ?? -1),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let code = object["code"] as? Int, code == 200
+            else {
+                return ConsumeResult(statusCode: statusCode, body: body, months: nil, tokenExpired: tokenExpired)
+            }
+
+            let rows = (object["rows"] as? [[String: Any]]) ?? []
+            let months = rows.compactMap(ConsumeMonth.init)
+                .sorted { $0.queryDate > $1.queryDate }
+
+            return ConsumeResult(statusCode: statusCode, body: body, months: months, tokenExpired: false)
+        } catch {
+            throw ArchiveRequestError.message(error.localizedDescription)
+        }
+    }
+}
+
+private struct ConsumeMonth: Identifiable, Equatable {
+    let id: Int
+    let date: String          // "2026年10月"
+    let queryDate: String     // "2026-10"（用于排序）
+    let amount: Decimal
+    let times: Int
+    let consumeDays: Int
+    let diningDays: Int
+    let dayRatio: String      // "83.00%"
+    let isNormal: Bool
+    let name: String
+    let className: String
+
+    var ratioValue: CGFloat {
+        let clean = dayRatio.replacingOccurrences(of: "%", with: "")
+        return CGFloat(Double(clean) ?? 0) / 100
+    }
+
+    init?(from row: [String: Any]) {
+        guard let id = row["id"] as? Int,
+              let date = row["consume_date"] as? String,
+              let queryDate = row["consume_query_date"] as? String,
+              let amountNum = row["consume_amount"] as? NSNumber
+        else { return nil }
+
+        self.id = id
+        self.date = date
+        self.queryDate = queryDate
+        self.amount = amountNum.decimalValue
+        self.times = (row["consume_times"] as? NSNumber)?.intValue ?? 0
+        self.consumeDays = (row["consume_days"] as? NSNumber)?.intValue ?? 0
+        self.diningDays = (row["dining_days"] as? NSNumber)?.intValue ?? 0
+        self.dayRatio = (row["consume_day_ratio"] as? String) ?? "0%"
+        // is_normal_dict == "正常" 为正常，其余为异常
+        let dict = (row["is_normal_dict"] as? String) ?? ""
+        self.isNormal = dict.contains("正常") && !dict.contains("异常")
+        self.name = (row["nick_name"] as? String) ?? ""
+        self.className = (row["stu_class_name"] as? String) ?? ""
+    }
+}
+
+private struct ConsumeReport: Equatable {
+    let name: String
+    let className: String
+    let months: [ConsumeMonth]
+
+    var totalAmount: Decimal {
+        months.reduce(0) { $0 + $1.amount }
+    }
+    var avgAmount: Decimal {
+        months.isEmpty ? 0 : totalAmount / Decimal(months.count)
+    }
+}
+
+private struct ConsumeResult {
+    let statusCode: Int?
+    let body: String
+    let months: [ConsumeMonth]?
+    let tokenExpired: Bool
+
+    var isSuccess: Bool {
+        guard let statusCode else { return false }
+        return (200..<300).contains(statusCode)
     }
 }
 
