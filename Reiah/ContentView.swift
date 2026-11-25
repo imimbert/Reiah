@@ -775,9 +775,9 @@ struct ArchiveLookupView: View {
             // 2. 用登录返回的 userId 查档。
             var archiveResult = try await requestArchive(userId: session.userId, token: session.token)
 
-            // 3. 只有服务端明确拒绝当前 token 时才重新登录一次，再查一次。
+            // 3. 只有服务端明确拒绝当前 token 时才强制重新登录一次，再查一次。
             if archiveResult.tokenExpired {
-                session = try await AuthService.login(for: account)
+                session = try await AuthService.login(for: account, forceRefresh: true)
                 archiveResult = try await requestArchive(userId: session.userId, token: session.token)
             }
 
@@ -957,17 +957,28 @@ struct CardBalanceLookupView: View {
 
         do {
             // 1. 登录拿 userId（belongUserId）
-            let session = try await AuthService.login(for: account)
+            var session = try await AuthService.login(for: account)
 
             // 2. 查余额
-            let amount = try await requestBalance(userId: session.userId, token: session.token)
+            var result = try await requestBalance(userId: session.userId, token: session.token)
+
+            // 3. token 过期则强制重新登录一次再查
+            if result.tokenExpired {
+                session = try await AuthService.login(for: account, forceRefresh: true)
+                result = try await requestBalance(userId: session.userId, token: session.token)
+            }
+
+            guard result.isSuccess, let amount = result.amount else {
+                throw ArchiveRequestError.response(statusCode: result.statusCode, body: result.body)
+            }
+
             balance = amount
         } catch {
             errorText = "查询失败：\((error as? ArchiveRequestError)?.errorDescription ?? error.localizedDescription)"
         }
     }
 
-    private func requestBalance(userId: String, token: String) async throws -> Decimal {
+    private func requestBalance(userId: String, token: String) async throws -> BalanceResult {
         var components = URLComponents(string: "https://portal.haierschool.cn/v/payCardTrade/personCardBalance")!
         components.queryItems = [URLQueryItem(name: "belongUserId", value: userId)]
 
@@ -981,33 +992,40 @@ struct CardBalanceLookupView: View {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode
+            let body = String(data: data, encoding: .utf8) ?? "<无法解析响应>"
 
-            guard (200..<300).contains(statusCode ?? -1) else {
-                let body = String(data: data, encoding: .utf8) ?? "<无法解析响应>"
-                throw ArchiveRequestError.response(statusCode: statusCode, body: body)
-            }
+            let tokenExpired = statusCode == 401 || statusCode == 403 || SessionStore.responseIndicatesExpired(data)
 
-            guard
-                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                let code = object["code"] as? Int, code == 200
+            guard (200..<300).contains(statusCode ?? -1),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let code = object["code"] as? Int, code == 200
             else {
-                let body = String(data: data, encoding: .utf8) ?? "<无法解析响应>"
-                throw ArchiveRequestError.response(statusCode: statusCode, body: body)
+                return BalanceResult(statusCode: statusCode, body: body, amount: nil, tokenExpired: tokenExpired)
             }
 
             // balanceAmount 可能是 Double 或 String
             if let number = object["balanceAmount"] as? NSNumber {
-                return number.decimalValue
+                return BalanceResult(statusCode: statusCode, body: body, amount: number.decimalValue, tokenExpired: false)
             }
             if let text = object["balanceAmount"] as? String, let value = Decimal(string: text) {
-                return value
+                return BalanceResult(statusCode: statusCode, body: body, amount: value, tokenExpired: false)
             }
-            throw ArchiveRequestError.message("余额字段缺失或格式异常")
-        } catch let error as ArchiveRequestError {
-            throw error
+            return BalanceResult(statusCode: statusCode, body: body, amount: nil, tokenExpired: false)
         } catch {
             throw ArchiveRequestError.message(error.localizedDescription)
         }
+    }
+}
+
+private struct BalanceResult {
+    let statusCode: Int?
+    let body: String
+    let amount: Decimal?
+    let tokenExpired: Bool
+
+    var isSuccess: Bool {
+        guard let statusCode else { return false }
+        return (200..<300).contains(statusCode) && amount != nil
     }
 }
 
@@ -1048,10 +1066,10 @@ private struct LoginSession: Codable {
 }
 
 /// 共享的登录入口：用户名即学号，默认密码 HS123456，sysType=3。
-/// 本地已缓存则直接返回，避免每次都重新登录。
+/// 本地已缓存则直接返回，避免每次都重新登录；`forceRefresh` 为 true 时跳过缓存强制重新登录。
 private enum AuthService {
-    static func login(for account: String) async throws -> LoginSession {
-        if let cached = SessionStore.session(for: account) {
+    static func login(for account: String, forceRefresh: Bool = false) async throws -> LoginSession {
+        if !forceRefresh, let cached = SessionStore.session(for: account) {
             return cached
         }
 
