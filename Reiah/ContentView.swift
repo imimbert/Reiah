@@ -292,46 +292,315 @@ struct V1MenuView: View {
 
 // MARK: - v2 占位
 
-/// v2 二级菜单的占位页，等待后续功能升级。
+/// v2 查询页：使用授权学号登录后，按姓名查询学生用户 ID。
 struct V2PlaceholderView: View {
     @State private var appeared = false
+    @State private var account = ""
+    @State private var searchName = ""
+    @State private var isLoading = false
+    @State private var searched = false
+    @State private var records: [V2UserIdRecord] = []
+    @State private var errorText: String?
+    @FocusState private var accountFocused: Bool
+    @FocusState private var nameFocused: Bool
+
+    private let accent = Color(red: 0.55, green: 0.45, blue: 0.90)
+
+    private var canSubmit: Bool {
+        !isLoading &&
+        !account.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+        !searchName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var body: some View {
         ZStack {
             AuroraBackground()
 
-            VStack(spacing: 18) {
-                Image(systemName: "sparkles")
-                    .font(.system(size: 52, weight: .semibold))
-                    .foregroundStyle(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.55, green: 0.45, blue: 0.90),
-                                Color(red: 0.35, green: 0.72, blue: 1.0)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
+            ScrollView {
+                VStack(spacing: 20) {
+                    VStack(spacing: 10) {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 42, weight: .semibold))
+                            .foregroundStyle(
+                                LinearGradient(
+                                    colors: [accent, Color(red: 0.35, green: 0.72, blue: 1.0)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .symbolEffect(.pulse, options: .repeating.speed(0.6))
+
+                        VStack(spacing: 5) {
+                            Text("v2 · 查用户 ID")
+                                .font(.title2.weight(.bold))
+                                .foregroundStyle(Color.themeInk)
+                            Text("输入姓名，查询 5 位用户 ID")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.top, 12)
+
+                    inputCard(
+                        title: "授权学号",
+                        placeholder: "输入用于登录的 H 开头学号",
+                        systemImage: "person.badge.key.fill",
+                        text: $account,
+                        focused: $accountFocused,
+                        monospaced: true
                     )
-                    .symbolEffect(.pulse, options: .repeating.speed(0.6))
 
-                VStack(spacing: 8) {
-                    Text("v2")
-                        .font(.system(size: 30, weight: .bold))
-                        .foregroundStyle(Color.themeInk)
+                    inputCard(
+                        title: "学生姓名",
+                        placeholder: "请输入姓名",
+                        systemImage: "person.fill",
+                        text: $searchName,
+                        focused: $nameFocused
+                    )
 
-                    Text("新功能正在准备中")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    queryButton(title: "查询 ID", isLoading: isLoading, action: { search() })
+                        .disabled(!canSubmit)
+
+                    if searched {
+                        if records.isEmpty {
+                            emptyResult
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        } else {
+                            ForEach(records) { record in
+                                V2UserIdResultCard(record: record)
+                                    .transition(.asymmetric(
+                                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                                        removal: .opacity))
+                            }
+                        }
+                    } else if let errorText {
+                        ResultCard(resultText: errorText, httpStatus: nil)
+                    }
+
+                    Text("仅限授权用途。查询结果仅展示姓名和用户 ID。")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
+                        .padding(.top, 2)
                 }
+                .padding(20)
+                .opacity(appeared ? 1 : 0)
+                .offset(y: appeared ? 0 : 16)
+                .animation(.spring(response: 0.7, dampingFraction: 0.86), value: appeared)
+                .animation(.spring(response: 0.5, dampingFraction: 0.85), value: records)
             }
-            .opacity(appeared ? 1 : 0)
-            .offset(y: appeared ? 0 : 16)
-            .animation(.spring(response: 0.9, dampingFraction: 0.86), value: appeared)
+            .scrollIndicators(.hidden)
+            .scrollDismissesKeyboard(.interactively)
         }
         .navigationTitle("v2")
         .navigationBarTitleDisplayMode(.inline)
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: isLoading)
         .onAppear { appeared = true }
+    }
+
+    private var emptyResult: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "person.crop.circle.badge.questionmark")
+                .font(.system(size: 34))
+                .foregroundStyle(.secondary)
+            Text(errorText ?? "未找到符合条件的学生")
+                .font(.headline)
+                .foregroundStyle(Color.themeInk)
+            Text("请检查姓名；接口仅查询学生类型并展示 5 位用户 ID。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(24)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
+    }
+
+    private func search() {
+        accountFocused = false
+        nameFocused = false
+        Task { await performSearch() }
+    }
+
+    @MainActor
+    private func performSearch() async {
+        isLoading = true
+        searched = false
+        records = []
+        errorText = nil
+        defer { isLoading = false }
+
+        let loginAccount = account.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = searchName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !loginAccount.isEmpty, !name.isEmpty else { return }
+
+        do {
+            var session = try await AuthService.login(for: loginAccount)
+            var result = try await requestUserIds(name: name, token: session.token)
+
+            if result.tokenExpired {
+                session = try await AuthService.login(for: loginAccount, forceRefresh: true)
+                result = try await requestUserIds(name: name, token: session.token)
+            }
+
+            guard result.isSuccess, let matches = result.records else {
+                throw ArchiveRequestError.response(statusCode: result.statusCode, body: result.body)
+            }
+
+            let exactMatches = matches.filter {
+                $0.name.compare(name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+            }
+            records = exactMatches.isEmpty ? matches : exactMatches
+            searched = true
+        } catch {
+            errorText = "查询失败：\((error as? ArchiveRequestError)?.errorDescription ?? error.localizedDescription)"
+        }
+    }
+
+    private func requestUserIds(name: String, token: String) async throws -> V2UserIdResult {
+        var components = URLComponents(string: "https://portal.haierschool.cn/v/sysDynamicTable/v1/getTableValuePage")!
+        components.queryItems = [
+            URLQueryItem(name: "dataCode", value: "dwd_userBaseData"),
+            URLQueryItem(name: "dataFrom", value: "DW"),
+            URLQueryItem(name: "tableName", value: "dwd_user_base_data"),
+            URLQueryItem(name: "pageNum", value: "1"),
+            URLQueryItem(name: "pageSize", value: "100"),
+            URLQueryItem(name: "search_field", value: name),
+            URLQueryItem(name: "user_type", value: "01")
+        ]
+
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json;charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("3", forHTTPHeaderField: "sysType")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 60
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode
+            let body = String(data: data, encoding: .utf8) ?? "<无法解析响应>"
+            let tokenExpired = statusCode == 401 || statusCode == 403 || SessionStore.responseIndicatesExpired(data)
+
+            guard (200..<300).contains(statusCode ?? -1),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let code = root["code"] as? Int ?? Int(root["code"] as? String ?? ""),
+                  code == 200
+            else {
+                return V2UserIdResult(statusCode: statusCode, body: body, records: nil, tokenExpired: tokenExpired)
+            }
+
+            let rows = (root["rows"] as? [[String: Any]])
+                ?? ((root["data"] as? [String: Any])?["rows"] as? [[String: Any]])
+                ?? []
+            let records = rows.compactMap(V2UserIdRecord.init)
+            return V2UserIdResult(statusCode: statusCode, body: body, records: records, tokenExpired: false)
+        } catch let error as ArchiveRequestError {
+            throw error
+        } catch {
+            throw ArchiveRequestError.message(error.localizedDescription)
+        }
+    }
+}
+
+private struct V2UserIdRecord: Identifiable, Equatable {
+    let name: String
+    let userId: String
+
+    var id: String { "\(name)-\(userId)" }
+
+    init?(from row: [String: Any]) {
+        guard let value = row["tableValue"] as? [String: Any],
+              let name = value["nick_name"] as? String,
+              let rawId = value["user_id"]
+        else { return nil }
+
+        let userId: String
+        if let text = rawId as? String {
+            userId = text
+        } else if let number = rawId as? NSNumber {
+            userId = number.stringValue
+        } else {
+            return nil
+        }
+
+        guard userId.utf8.count == 5,
+              userId.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 })
+        else { return nil }
+        self.name = name
+        self.userId = userId
+    }
+}
+
+private struct V2UserIdResult {
+    let statusCode: Int?
+    let body: String
+    let records: [V2UserIdRecord]?
+    let tokenExpired: Bool
+
+    var isSuccess: Bool {
+        guard let statusCode else { return false }
+        return (200..<300).contains(statusCode) && records != nil
+    }
+}
+
+private struct V2UserIdResultCard: View {
+    let record: V2UserIdRecord
+    @State private var copied = false
+    private let accent = Color(red: 0.55, green: 0.45, blue: 0.90)
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "person.crop.circle.fill")
+                .font(.system(size: 38))
+                .foregroundStyle(accent)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(record.name)
+                    .font(.headline)
+                    .foregroundStyle(Color.themeInk)
+                Text("用户 ID")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Text(record.userId)
+                .font(.system(.title2, design: .rounded).weight(.bold))
+                .monospacedDigit()
+                .foregroundStyle(Color.themeInk)
+
+            Button {
+                UIPasteboard.general.string = record.userId
+                copied = true
+            } label: {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(copied ? .green : accent)
+                    .frame(width: 38, height: 38)
+                    .background(Circle().fill(accent.opacity(0.10)))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(copied ? "已复制 ID" : "复制 ID")
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .strokeBorder(.white.opacity(0.5), lineWidth: 0.5)
+        )
+        .shadow(color: Color.black.opacity(0.06), radius: 14, y: 7)
     }
 }
 
