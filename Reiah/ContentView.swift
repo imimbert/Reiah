@@ -123,70 +123,26 @@ struct ContentView: View {
         GlassEffectContainer(spacing: 18) {
             VStack(spacing: 18) {
                 card(
-                    title: "查学号",
-                    subtitle: "输入姓名查询学号信息",
-                    systemImage: "person.text.rectangle",
+                    title: "v1",
+                    subtitle: "现有功能集合",
+                    systemImage: "square.stack.3d.up.fill",
                     accent: Color(red: 0.0, green: 0.42, blue: 0.86),
-                    id: "stu"
+                    id: "v1"
                 ) {
-                    StudentIdLookupView()
+                    V1MenuView()
                 }
                 .reveal(appeared, delay: 0.15)
 
                 card(
-                    title: "查档",
-                    subtitle: "通过学号查询学生档案",
-                    systemImage: "doc.text.magnifyingglass",
-                    accent: Color(red: 0.35, green: 0.60, blue: 0.90),
-                    id: "arch"
+                    title: "v2",
+                    subtitle: "新功能准备中",
+                    systemImage: "sparkles",
+                    accent: Color(red: 0.55, green: 0.45, blue: 0.90),
+                    id: "v2"
                 ) {
-                    ArchiveLookupView()
+                    V2PlaceholderView()
                 }
                 .reveal(appeared, delay: 0.23)
-
-                card(
-                    title: "查卡余额",
-                    subtitle: "输入学号查询一卡通余额",
-                    systemImage: "creditcard.fill",
-                    accent: Color(red: 0.20, green: 0.62, blue: 0.45),
-                    id: "card"
-                ) {
-                    CardBalanceLookupView()
-                }
-                .reveal(appeared, delay: 0.27)
-
-                card(
-                    title: "查消费",
-                    subtitle: "输入学号查询月度消费汇总",
-                    systemImage: "fork.knife",
-                    accent: Color(red: 0.90, green: 0.45, blue: 0.20),
-                    id: "consume"
-                ) {
-                    ConsumeLookupView()
-                }
-                .reveal(appeared, delay: 0.30)
-
-                card(
-                    title: "消费明细",
-                    subtitle: "按月查看每笔消费记录",
-                    systemImage: "list.bullet.rectangle",
-                    accent: Color(red: 0.80, green: 0.35, blue: 0.55),
-                    id: "consumeDetail"
-                ) {
-                    ConsumeDetailLookupView()
-                }
-                .reveal(appeared, delay: 0.33)
-
-                card(
-                    title: "加密钱包",
-                    subtitle: "解析链上地址的多链资产",
-                    systemImage: "wallet.bifold.fill",
-                    accent: Color(red: 0.42, green: 0.32, blue: 0.85),
-                    id: "wallet"
-                ) {
-                    WalletLookupView()
-                }
-                .reveal(appeared, delay: 0.31)
             }
         }
     }
@@ -230,6 +186,152 @@ struct ContentView: View {
         .buttonStyle(PressableCardStyle())
         .matchedTransitionSource(id: "about", in: zoom)
         .reveal(appeared, delay: 0.39)
+    }
+}
+
+// MARK: - v1 功能菜单
+
+/// v1 二级菜单：汇集所有现有功能。
+struct V1MenuView: View {
+    @Namespace private var zoom
+
+    var body: some View {
+        ZStack {
+            AuroraBackground()
+
+            ScrollView {
+                VStack(spacing: 16) {
+                    card(
+                        title: "查学号",
+                        subtitle: "输入姓名查询学号信息",
+                        systemImage: "person.text.rectangle",
+                        accent: Color(red: 0.0, green: 0.42, blue: 0.86),
+                        id: "stu"
+                    ) {
+                        StudentIdLookupView()
+                    }
+
+                    card(
+                        title: "查档",
+                        subtitle: "通过学号查询学生档案",
+                        systemImage: "doc.text.magnifyingglass",
+                        accent: Color(red: 0.35, green: 0.60, blue: 0.90),
+                        id: "arch"
+                    ) {
+                        ArchiveLookupView()
+                    }
+
+                    card(
+                        title: "查卡余额",
+                        subtitle: "输入学号查询一卡通余额",
+                        systemImage: "creditcard.fill",
+                        accent: Color(red: 0.20, green: 0.62, blue: 0.45),
+                        id: "card"
+                    ) {
+                        CardBalanceLookupView()
+                    }
+
+                    card(
+                        title: "查消费",
+                        subtitle: "输入学号查询月度消费汇总",
+                        systemImage: "fork.knife",
+                        accent: Color(red: 0.90, green: 0.45, blue: 0.20),
+                        id: "consume"
+                    ) {
+                        ConsumeLookupView()
+                    }
+
+                    card(
+                        title: "消费明细",
+                        subtitle: "按月查看每笔消费记录",
+                        systemImage: "list.bullet.rectangle",
+                        accent: Color(red: 0.80, green: 0.35, blue: 0.55),
+                        id: "consumeDetail"
+                    ) {
+                        ConsumeDetailLookupView()
+                    }
+
+                    card(
+                        title: "加密钱包",
+                        subtitle: "解析链上地址的多链资产",
+                        systemImage: "wallet.bifold.fill",
+                        accent: Color(red: 0.42, green: 0.32, blue: 0.85),
+                        id: "wallet"
+                    ) {
+                        WalletLookupView()
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 12)
+                .padding(.bottom, 40)
+            }
+            .scrollIndicators(.hidden)
+        }
+        .navigationTitle("v1")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func card<Destination: View>(
+        title: String,
+        subtitle: String,
+        systemImage: String,
+        accent: Color,
+        id: String,
+        @ViewBuilder destination: () -> Destination
+    ) -> some View {
+        NavigationLink {
+            destination()
+                .navigationTransition(.zoom(sourceID: id, in: zoom))
+        } label: {
+            FeatureCard(title: title, subtitle: subtitle, systemImage: systemImage, accent: accent)
+        }
+        .buttonStyle(PressableCardStyle())
+        .matchedTransitionSource(id: id, in: zoom)
+    }
+}
+
+// MARK: - v2 占位
+
+/// v2 二级菜单的占位页，等待后续功能升级。
+struct V2PlaceholderView: View {
+    @State private var appeared = false
+
+    var body: some View {
+        ZStack {
+            AuroraBackground()
+
+            VStack(spacing: 18) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 52, weight: .semibold))
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.55, green: 0.45, blue: 0.90),
+                                Color(red: 0.35, green: 0.72, blue: 1.0)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .symbolEffect(.pulse, options: .repeating.speed(0.6))
+
+                VStack(spacing: 8) {
+                    Text("v2")
+                        .font(.system(size: 30, weight: .bold))
+                        .foregroundStyle(Color.themeInk)
+
+                    Text("新功能正在准备中")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .opacity(appeared ? 1 : 0)
+            .offset(y: appeared ? 0 : 16)
+            .animation(.spring(response: 0.9, dampingFraction: 0.86), value: appeared)
+        }
+        .navigationTitle("v2")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear { appeared = true }
     }
 }
 
